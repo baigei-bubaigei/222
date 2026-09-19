@@ -4,11 +4,10 @@ import test from "node:test";
 
 const templateRoot = new URL("../", import.meta.url);
 const previewRoot = new URL("../app/_sites-preview/", import.meta.url);
+let workerPromise;
 
 async function render() {
-  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
-  const { default: worker } = await import(workerUrl.href);
+  const worker = await loadWorker();
 
   return worker.fetch(
     new Request("http://localhost/", {
@@ -24,6 +23,14 @@ async function render() {
       passThroughOnException() {},
     },
   );
+}
+
+async function loadWorker() {
+  if (workerPromise) return workerPromise;
+  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
+  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
+  workerPromise = import(workerUrl.href).then(({ default: worker }) => worker);
+  return workerPromise;
 }
 
 test("server-renders the weather dashboard", async () => {
@@ -80,4 +87,50 @@ test("keeps the loading skeleton scoped and disposable", async () => {
   await assert.rejects(
     access(new URL("public/_sites-preview", templateRoot)),
   );
+});
+
+test("protects favorite writes and validates favorite payloads", async () => {
+  const worker = await loadWorker();
+  const env = {
+    ASSETS: {
+      fetch: async () => new Response("Not found", { status: 404 }),
+    },
+  };
+  const context = {
+    waitUntil() {},
+    passThroughOnException() {},
+  };
+
+  const anonymous = await worker.fetch(
+    new Request("http://localhost/api/favorites"),
+    env,
+    context,
+  );
+  assert.equal(anonymous.status, 401);
+
+  const authHeaders = {
+    "oai-authenticated-user-id": "test-user",
+    "oai-authenticated-user-email": "test@example.com",
+    "content-type": "application/json",
+  };
+  const invalid = await worker.fetch(
+    new Request("http://localhost/api/favorites", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ city: { name: "香港" } }),
+    }),
+    env,
+    context,
+  );
+  assert.equal(invalid.status, 400);
+
+  const invalidDelete = await worker.fetch(
+    new Request("http://localhost/api/favorites?cityId=", {
+      method: "DELETE",
+      headers: authHeaders,
+    }),
+    env,
+    context,
+  );
+  assert.equal(invalidDelete.status, 400);
 });

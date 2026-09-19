@@ -3,6 +3,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
 type LocationResult = {
+  id?: number | string;
   name: string;
   latitude: number;
   longitude: number;
@@ -10,6 +11,18 @@ type LocationResult = {
   country?: string;
   admin1?: string;
 };
+
+type FavoriteCity = {
+  cityId: string;
+  name: string;
+  latitude?: number;
+  longitude?: number;
+  timezone?: string;
+  country?: string;
+  admin1?: string;
+};
+
+type FavoriteSyncState = "local" | "loading" | "saving" | "synced" | "error";
 
 type AirQuality = {
   current: { us_aqi: number; pm2_5: number };
@@ -52,6 +65,7 @@ type ForecastData = {
 type UserSnapshot = { displayName: string; email: string } | null;
 
 const DEFAULT_LOCATION: LocationResult = {
+  id: "hong-kong-22.27832-114.17469",
   name: "香港",
   admin1: "香港特别行政区",
   latitude: 22.27832,
@@ -109,6 +123,86 @@ const formatDay = (date: string, index: number) => {
 const formatDate = (date: string) => new Intl.DateTimeFormat("zh-CN", { month: "long", day: "numeric", weekday: "long" }).format(new Date(`${date}T12:00:00`));
 const getLocalHour = (time: string) => time.includes("T") ? time.slice(11, 16) : time;
 
+const FAVORITES_STORAGE_KEY = "isobar-favorites";
+
+function cityIdForLocation(location: LocationResult) {
+  return String(location.id ?? `${location.name}:${location.latitude.toFixed(4)}:${location.longitude.toFixed(4)}`);
+}
+
+function favoriteForLocation(location: LocationResult): FavoriteCity {
+  return {
+    cityId: cityIdForLocation(location),
+    name: location.name,
+    latitude: location.latitude,
+    longitude: location.longitude,
+    timezone: location.timezone,
+    country: location.country,
+    admin1: location.admin1,
+  };
+}
+
+function normalizeFavoriteCity(item: unknown): FavoriteCity | null {
+  if (!item || typeof item !== "object") return null;
+  const candidate = item as Partial<FavoriteCity>;
+  if (typeof candidate.cityId !== "string" || typeof candidate.name !== "string") return null;
+  return {
+    cityId: candidate.cityId,
+    name: candidate.name,
+    latitude: typeof candidate.latitude === "number" ? candidate.latitude : undefined,
+    longitude: typeof candidate.longitude === "number" ? candidate.longitude : undefined,
+    timezone: typeof candidate.timezone === "string" ? candidate.timezone : undefined,
+    country: typeof candidate.country === "string" ? candidate.country : undefined,
+    admin1: typeof candidate.admin1 === "string" ? candidate.admin1 : undefined,
+  };
+}
+
+function readLocalFavorites(): FavoriteCity[] {
+  try {
+    const raw = window.localStorage.getItem(FAVORITES_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed.flatMap((item): FavoriteCity[] => {
+      if (typeof item === "string" && item.trim()) {
+        return [{ cityId: `legacy:${item.trim()}`, name: item.trim() }];
+      }
+      const favorite = normalizeFavoriteCity(item);
+      return favorite ? [favorite] : [];
+    });
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalFavorites(favorites: FavoriteCity[]) {
+  window.localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(favorites));
+}
+
+function dedupeFavorites(favorites: FavoriteCity[]) {
+  return favorites.filter((favorite, index, all) => all.findIndex((item) => item.cityId === favorite.cityId) === index);
+}
+
+function canSyncFavorite(favorite: FavoriteCity): favorite is FavoriteCity & Required<Pick<FavoriteCity, "latitude" | "longitude" | "timezone">> {
+  return typeof favorite.latitude === "number" && typeof favorite.longitude === "number" && typeof favorite.timezone === "string";
+}
+
+async function saveRemoteFavorite(favorite: FavoriteCity) {
+  const response = await fetch("/api/favorites", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ city: favorite }),
+  });
+  if (!response.ok) throw new Error("收藏同步失败");
+  const payload = await response.json() as { favorite?: FavoriteCity };
+  return payload.favorite ?? favorite;
+}
+
+async function deleteRemoteFavorite(cityId: string) {
+  const response = await fetch(`/api/favorites?cityId=${encodeURIComponent(cityId)}`, { method: "DELETE" });
+  if (!response.ok) throw new Error("收藏同步失败");
+}
+
 async function searchLocation(query: string) {
   const response = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(query)}&count=1&language=zh&format=json`);
   if (!response.ok) throw new Error("城市搜索暂时不可用");
@@ -134,7 +228,7 @@ function Metric({ label, value, unit, icon, detail }: { label: string; value: st
   return <div className="metric-card"><span className="metric-icon" aria-hidden="true">{icon}</span><div><span className="metric-label">{label}</span><strong>{value}<em>{unit}</em></strong>{detail && <small>{detail}</small>}</div></div>;
 }
 
-function LineChart({ values, color, max, min }: { values: number[]; color: string; max?: number; min?: number }) {
+function LineChart({ values, color, max, min, label }: { values: number[]; color: string; max?: number; min?: number; label: string }) {
   const width = 310;
   const height = 92;
   const upper = max ?? Math.max(...values, 1);
@@ -142,7 +236,7 @@ function LineChart({ values, color, max, min }: { values: number[]; color: strin
   const span = Math.max(upper - lower, 1);
   const points = values.map((value, index) => `${(index / Math.max(values.length - 1, 1)) * width},${height - ((value - lower) / span) * (height - 10) - 5}`).join(" ");
   const areaPoints = `0,${height} ${points} ${width},${height}`;
-  return <svg className="line-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="天气趋势折线图"><defs><linearGradient id={`gradient-${color.replace("#", "")}`} x1="0" x2="0" y1="0" y2="1"><stop offset="0" stopColor={color} stopOpacity=".22" /><stop offset="1" stopColor={color} stopOpacity="0" /></linearGradient></defs><polygon points={areaPoints} fill={`url(#gradient-${color.replace("#", "")})`} /><polyline points={points} fill="none" stroke={color} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />{values.map((value, index) => <circle key={`${value}-${index}`} cx={(index / Math.max(values.length - 1, 1)) * width} cy={height - ((value - lower) / span) * (height - 10) - 5} r="3.5" fill="#fff" stroke={color} strokeWidth="2" />)}</svg>;
+  return <svg className="line-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${label}未来 8 小时趋势图`}><defs><linearGradient id={`gradient-${color.replace("#", "")}`} x1="0" x2="0" y1="0" y2="1"><stop offset="0" stopColor={color} stopOpacity=".22" /><stop offset="1" stopColor={color} stopOpacity="0" /></linearGradient></defs><polygon points={areaPoints} fill={`url(#gradient-${color.replace("#", "")})`} /><polyline points={points} fill="none" stroke={color} strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />{values.map((value, index) => <circle key={`${value}-${index}`} cx={(index / Math.max(values.length - 1, 1)) * width} cy={height - ((value - lower) / span) * (height - 10) - 5} r="3.5" fill="#fff" stroke={color} strokeWidth="2" />)}</svg>;
 }
 
 function trendSummary(forecast: ForecastData) {
@@ -165,7 +259,10 @@ export default function WeatherDashboard({ user, signInHref, signOutHref }: { us
   const [authOpen, setAuthOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
-  const [favorites, setFavorites] = useState<string[]>([]);
+  const [favorites, setFavorites] = useState<FavoriteCity[]>([]);
+  const [favoriteSync, setFavoriteSync] = useState<FavoriteSyncState>(user ? "loading" : "local");
+  const [favoriteMessage, setFavoriteMessage] = useState("");
+  const [favoriteSavingId, setFavoriteSavingId] = useState("");
 
   const loadWeather = async (nextLocation: LocationResult) => {
     setIsLoading(true); setError("");
@@ -177,25 +274,119 @@ export default function WeatherDashboard({ user, signInHref, signOutHref }: { us
   // 远程天气请求需要在客户端挂载后进行，避免把实时数据写入服务端渲染结果。
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { void loadWeather(DEFAULT_LOCATION); }, []);
+
+  // 登录后以 D1 为收藏夹来源，并将游客期间保存的完整城市快照合并进去。
+  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => {
-    try {
-      const saved = window.localStorage.getItem("isobar-favorites");
-      if (saved) queueMicrotask(() => setFavorites(JSON.parse(saved) as string[]));
-    } catch {
-      // 本地偏好不可用时继续使用空收藏夹。
+    let active = true;
+    const localFavorites = readLocalFavorites();
+
+    if (!user) {
+      queueMicrotask(() => {
+        if (!active) return;
+        setFavorites(localFavorites);
+        setFavoriteSync("local");
+        setFavoriteMessage("");
+      });
+      return () => { active = false; };
     }
-  }, []);
+
+    const syncFavorites = async () => {
+      setFavoriteSync("loading");
+      setFavoriteMessage("");
+      try {
+        const response = await fetch("/api/favorites", { cache: "no-store" });
+        if (!response.ok) throw new Error("收藏读取失败");
+        const payload = await response.json() as { favorites?: unknown };
+        let remoteFavorites = Array.isArray(payload.favorites)
+          ? payload.favorites.flatMap((item) => {
+            const favorite = normalizeFavoriteCity(item);
+            return favorite ? [favorite] : [];
+          })
+          : [];
+        const localToUpload = localFavorites.filter(canSyncFavorite);
+
+        if (localToUpload.length) {
+          const uploaded = await Promise.all(localToUpload.map(saveRemoteFavorite));
+          remoteFavorites = dedupeFavorites([...remoteFavorites, ...uploaded]);
+          window.localStorage.removeItem(FAVORITES_STORAGE_KEY);
+        }
+
+        if (!active) return;
+        setFavorites(dedupeFavorites(remoteFavorites));
+        setFavoriteSync("synced");
+      } catch {
+        if (!active) return;
+        setFavorites(localFavorites);
+        setFavoriteSync("error");
+        setFavoriteMessage("收藏暂时未同步，稍后会自动重试。 ");
+      }
+    };
+
+    void syncFavorites();
+    return () => { active = false; };
+  }, [user]);
+
+  useEffect(() => {
+    if (!authOpen && !profileOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setAuthOpen(false);
+        setProfileOpen(false);
+      }
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [authOpen, profileOpen]);
 
   const currentMeta = weatherMeta(forecast.current.weather_code);
   const firstDate = forecast.daily.time[0] ?? new Date().toISOString().slice(0, 10);
   const hourlyStart = useMemo(() => { const currentHour = forecast.current.time.slice(0, 13); const match = forecast.hourly.time.findIndex((time) => time >= currentHour); return match >= 0 ? match : 0; }, [forecast]);
   const hours = forecast.hourly.time.slice(hourlyStart, hourlyStart + 8).map((time, index) => ({ time, temperature: forecast.hourly.temperature_2m[hourlyStart + index], code: forecast.hourly.weather_code[hourlyStart + index], rain: forecast.hourly.precipitation_probability[hourlyStart + index], humidity: forecast.hourly.relative_humidity_2m[hourlyStart + index], wind: forecast.hourly.wind_speed_10m[hourlyStart + index], air: forecast.airQuality.hourly.us_aqi[index] ?? forecast.airQuality.current.us_aqi }));
   const trend = trendSummary(forecast);
-  const isFavorite = favorites.includes(location.name);
+  const currentFavorite = favoriteForLocation(location);
+  const savedFavorite = favorites.find((favorite) => favorite.cityId === currentFavorite.cityId || (favorite.cityId.startsWith("legacy:") && favorite.name === location.name));
+  const isFavorite = Boolean(savedFavorite);
 
-  const toggleFavorite = () => {
-    const next = isFavorite ? favorites.filter((name) => name !== location.name) : [...favorites, location.name];
-    setFavorites(next); window.localStorage.setItem("isobar-favorites", JSON.stringify(next));
+  const toggleFavorite = async () => {
+    const nextFavorite = currentFavorite;
+    const previous = favorites;
+    const next = isFavorite
+      ? favorites.filter((favorite) => favorite.cityId !== savedFavorite?.cityId)
+      : dedupeFavorites([...favorites, nextFavorite]);
+
+    setFavorites(next);
+    setFavoriteMessage("");
+
+    if (!user) {
+      try {
+        writeLocalFavorites(next);
+        setFavoriteSync("local");
+      } catch {
+        setFavorites(previous);
+        setFavoriteSync("error");
+        setFavoriteMessage("当前设备无法保存收藏，请检查浏览器存储权限。");
+      }
+      return;
+    }
+
+    setFavoriteSavingId(nextFavorite.cityId);
+    setFavoriteSync("saving");
+    try {
+      if (isFavorite && savedFavorite) {
+        await deleteRemoteFavorite(savedFavorite.cityId);
+      } else {
+        const saved = await saveRemoteFavorite(nextFavorite);
+        setFavorites((current) => dedupeFavorites(current.map((favorite) => favorite.cityId === nextFavorite.cityId ? saved : favorite)));
+      }
+      setFavoriteSync("synced");
+    } catch {
+      setFavorites(previous);
+      setFavoriteSync("error");
+      setFavoriteMessage("收藏同步失败，请稍后再试。");
+    } finally {
+      setFavoriteSavingId("");
+    }
   };
 
   const submitSearch = async (event: FormEvent<HTMLFormElement>) => {
@@ -216,26 +407,26 @@ export default function WeatherDashboard({ user, signInHref, signOutHref }: { us
     <header className="app-header">
       <a className="brand" href="#top" aria-label="isobar 天气首页"><span className="brand-symbol"><i /><i /><i /></span><span>isobar<span className="brand-dot">.</span></span></a>
       <nav className="primary-nav" aria-label="主导航"><a className="active" href="#today">概览</a><a href="#forecast">7 天预报</a><a href="#insights">趋势分析</a><a href="#favorites">收藏夹</a></nav>
-      <div className="header-actions"><form className="searchbox" onSubmit={submitSearch}><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="搜索城市" placeholder="搜索城市" /><button type="submit" aria-label="搜索" disabled={isLoading}>↵</button></form><button className="icon-button favorite-button" onClick={() => document.getElementById("favorites")?.scrollIntoView({ behavior: "smooth" })} aria-label="查看收藏夹">♡<span>{favorites.length}</span></button>{user ? <button className="account-chip" onClick={() => setProfileOpen(true)}><span className="avatar">{user.displayName.slice(0, 1).toUpperCase()}</span><span className="account-name">{user.displayName}</span></button> : <button className="sign-in-button" onClick={() => { setAuthMode("login"); setAuthOpen(true); }}>登录 / 注册</button>}</div>
+      <div className="header-actions"><form className="searchbox" onSubmit={submitSearch}><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="搜索城市" placeholder="搜索城市" autoComplete="off" /><button type="submit" aria-label="搜索城市" disabled={isLoading}>↵</button></form><button type="button" className="icon-button favorite-button" onClick={() => document.getElementById("favorites")?.scrollIntoView({ behavior: "smooth" })} aria-label={`查看收藏夹，${favorites.length} 个城市`}><span aria-hidden="true">♡</span><span>{favorites.length}</span></button>{user ? <button type="button" className="account-chip" onClick={() => setProfileOpen(true)}><span className="avatar">{user.displayName.slice(0, 1).toUpperCase()}</span><span className="account-name">{user.displayName}</span></button> : <button type="button" className="sign-in-button" onClick={() => { setAuthMode("login"); setAuthOpen(true); }}>登录 / 注册</button>}</div>
     </header>
 
-    <section className="hero" id="top"><div><p className="eyebrow"><span className="eyebrow-dot" /> 实时天气 · {location.timezone.replace("_", " ")}</p><h1>{location.name}，<br /><span>今天适合怎样出门？</span></h1><p className="hero-copy">用一眼就能读懂的天气，把每天的决定变得轻一点。</p></div><div className="hero-side"><div className="location-pill"><span className="location-pin">⌖</span><span><strong>{location.name}</strong><small>{location.admin1 || location.country || "已定位城市"}</small></span><span className="live-pulse" title="数据正在更新" /></div><button className={`save-location ${isFavorite ? "saved" : ""}`} onClick={toggleFavorite}>{isFavorite ? "已收藏" : "收藏这个城市"} <span>{isFavorite ? "★" : "＋"}</span></button></div></section>
+    <section className="hero" id="top"><div><p className="eyebrow"><span className="eyebrow-dot" /> 实时天气 · {location.timezone.replace("_", " ")}</p><h1>{location.name}，<br /><span>今天适合怎样出门？</span></h1><p className="hero-copy">用一眼就能读懂的天气，把每天的决定变得轻一点。</p></div><div className="hero-side"><div className="location-pill"><span className="location-pin" aria-hidden="true">⌖</span><span><strong>{location.name}</strong><small>{location.admin1 || location.country || "已定位城市"}</small></span><span className="live-pulse" title="数据正在更新" /></div><button type="button" className={`save-location ${isFavorite ? "saved" : ""}`} onClick={() => void toggleFavorite()} aria-pressed={isFavorite} disabled={favoriteSavingId === currentFavorite.cityId}>{isFavorite ? "已收藏" : "收藏这个城市"} <span aria-hidden="true">{isFavorite ? "★" : "＋"}</span></button><p className={`favorite-status ${favoriteSync}`} aria-live="polite">{favoriteMessage || (favoriteSync === "loading" ? "正在读取收藏" : favoriteSync === "saving" ? "正在同步" : favoriteSync === "synced" ? "已同步到你的账号" : user ? "仅显示当前设备收藏" : "保存在当前设备")}</p></div></section>
 
     <section className="current-layout" id="today"><article className={`current-card ${currentMeta.tone}`}><div className="card-heading"><span>现在 · {getLocalHour(forecast.current.time)}</span><span className="status-chip">{isLoading ? "同步中" : "已更新"}</span></div><div className="current-main"><div><p className="date-line">{formatDate(firstDate)}</p><div className="temperature"><span>{Math.round(forecast.current.temperature_2m)}</span><sup>°</sup></div><p className="condition"><span className="condition-icon">{currentMeta.icon}</span>{currentMeta.label}</p><p className="feels">体感温度 {Math.round(forecast.current.apparent_temperature)}° · 降雨量 {forecast.current.precipitation.toFixed(1)} mm</p></div><div className="weather-orbit" aria-hidden="true"><span className="orbit-ring ring-one" /><span className="orbit-ring ring-two" /><span className="orbit-star star-one">✦</span><span className="orbit-star star-two">·</span><span className="orbit-weather">{currentMeta.icon}</span></div></div><div className="metric-row"><Metric label="湿度" value={String(Math.round(forecast.current.relative_humidity_2m))} unit="%" icon="◌" detail="相对湿度" /><Metric label="风速" value={String(Math.round(forecast.current.wind_speed_10m))} unit=" km/h" icon="≋" detail="当前风力" /><Metric label="降雨量" value={forecast.current.precipitation.toFixed(1)} unit=" mm" icon="⌁" detail="过去一小时" /><Metric label="空气质量" value={String(Math.round(forecast.airQuality.current.us_aqi))} unit=" AQI" icon="✦" detail={aqiLabel} /></div></article><aside className="insight-card"><div className="card-heading"><span>出门提示</span><span className="mini-icon">✦</span></div><div className="insight-graphic" aria-hidden="true"><span className="sun-shape" /><span className="cloud-shape cloud-a" /><span className="cloud-shape cloud-b" /><span className="rain-line rain-a" /><span className="rain-line rain-b" /><span className="rain-line rain-c" /></div><div className="insight-copy"><p className="insight-kicker">雨势提醒</p><h2>{forecast.daily.precipitation_probability_max[0] >= 70 ? "今天会下雨，记得带伞。" : "今天适合轻装出门。"}</h2><p>未来几小时降雨概率 {Math.round(hours[0]?.rain ?? forecast.daily.precipitation_probability_max[0])}%</p></div><div className="insight-footer"><span>日出 {getLocalHour(forecast.daily.sunrise[0])}</span><span>日落 {getLocalHour(forecast.daily.sunset[0])}</span></div></aside></section>
 
-    {error && <p className="error-banner" role="alert">{error}</p>}
+    {error && <p className="error-banner" role="alert" aria-live="assertive">{error}</p>}
     <section className="section-block hourly-block"><div className="section-heading"><div><p className="section-label">下一步</p><h2>未来 24 小时</h2></div><span>每小时更新</span></div><div className="hourly-strip">{hours.map((hour, index) => { const meta = weatherMeta(hour.code); return <div className={`hour-card ${index === 0 ? "selected" : ""}`} key={`${hour.time}-${index}`}><span className="hour-time">{index === 0 ? "现在" : getLocalHour(hour.time)}</span><span className={`hour-icon ${meta.tone}`}>{meta.icon}</span><strong>{Math.round(hour.temperature)}°</strong><span className="hour-rain"><i style={{ height: `${Math.max(5, hour.rain)}%` }} />{Math.round(hour.rain)}%</span></div>; })}</div></section>
 
-    <section className="section-block charts-block" id="insights"><div className="section-heading"><div><p className="section-label">看见变化</p><h2>天气数据图表</h2></div><span>未来 8 小时走势</span></div><div className="chart-grid">{chartSeries.map((chart) => <article className="chart-card" key={chart.label}><div className="chart-top"><span className="chart-icon" style={{ color: chart.color }}>{chart.icon}</span><div><span>{chart.label}</span><strong>{chart.value}<em>{chart.unit}</em></strong></div><span className="chart-detail">{chart.detail}</span></div><LineChart values={chart.values.length ? chart.values : [0]} color={chart.color} max={chart.max} min={chart.min} /><div className="chart-axis"><span>现在</span><span>+4 小时</span><span>+8 小时</span></div></article>)}</div></section>
+    <section className="section-block charts-block" id="insights"><div className="section-heading"><div><p className="section-label">看见变化</p><h2>天气数据图表</h2></div><span>未来 8 小时走势</span></div><div className="chart-grid">{chartSeries.map((chart) => <article className="chart-card" key={chart.label}><div className="chart-top"><span className="chart-icon" style={{ color: chart.color }} aria-hidden="true">{chart.icon}</span><div><span>{chart.label}</span><strong>{chart.value}<em>{chart.unit}</em></strong></div><span className="chart-detail">{chart.detail}</span></div><LineChart values={chart.values.length ? chart.values : [0]} color={chart.color} max={chart.max} min={chart.min} label={chart.label} /><div className="chart-axis"><span>现在</span><span>+4 小时</span><span>+8 小时</span></div></article>)}</div></section>
 
     <section className="section-block trend-layout"><article className={`trend-card ${trend.tone}`}><div className="section-heading"><div><p className="section-label">天气观察</p><h2>{trend.title}</h2></div><span>未来 7 天</span></div><p>{trend.copy}</p><div className="trend-bars">{forecast.daily.temperature_2m_max.map((value, index) => <div className="trend-bar" key={`${value}-${index}`}><span style={{ height: `${Math.max(22, Math.min(100, value * 2.2))}%` }} /><small>{formatDay(forecast.daily.time[index], index)}</small></div>)}</div></article><article className="air-card"><div className="section-heading"><div><p className="section-label">空气质量</p><h2>今天呼吸起来 {aqiLabel}</h2></div><span>{Math.round(forecast.airQuality.current.us_aqi)} AQI</span></div><div className="air-gauge"><div className="gauge-ring" style={{ ["--gauge" as string]: `${Math.min(100, forecast.airQuality.current.us_aqi)}%` }}><strong>{Math.round(forecast.airQuality.current.us_aqi)}</strong><small>AQI</small></div><div><p>PM2.5 <strong>{forecast.airQuality.current.pm2_5.toFixed(1)}</strong> μg/m³</p><p className="air-copy">空气状态适合正常户外活动，敏感人群可留意午后风向变化。</p></div></div></article></section>
 
     <section className="section-block week-block" id="forecast"><div className="section-heading"><div><p className="section-label">慢慢看</p><h2>未来 7 天</h2></div><span>最高 / 最低温度</span></div><div className="week-list">{forecast.daily.time.map((day, index) => { const meta = weatherMeta(forecast.daily.weather_code[index]); return <div className={`day-row ${index === 0 ? "today" : ""}`} key={day}><div className="day-name"><strong>{formatDay(day, index)}</strong><small>{day.slice(5).replace("-", "/")}</small></div><span className={`day-icon ${meta.tone}`}>{meta.icon}</span><span className="day-label">{meta.label}</span><div className="temp-range"><span>{Math.round(forecast.daily.temperature_2m_min[index])}°</span><div><i style={{ left: `${Math.min(84, Math.max(5, forecast.daily.temperature_2m_min[index] * 2))}%`, right: `${Math.max(5, 100 - forecast.daily.temperature_2m_max[index] * 2)}%` }} /></div><strong>{Math.round(forecast.daily.temperature_2m_max[index])}°</strong></div><span className="rain-chance">{Math.round(forecast.daily.precipitation_probability_max[index])}% <small>降雨</small></span><span className="rain-total">{(forecast.daily.precipitation_sum[index] ?? 0).toFixed(1)} mm</span></div>; })}</div></section>
 
-    <section className="section-block favorites-block" id="favorites"><div className="section-heading"><div><p className="section-label">你的城市</p><h2>收藏夹</h2></div><span>{favorites.length ? `${favorites.length} 个城市` : "还没有收藏"}</span></div>{favorites.length ? <div className="favorite-list">{favorites.map((name) => <button className="favorite-city" key={name} onClick={() => { setQuery(name); void (async () => { const next = await searchLocation(name); await loadWeather(next); })(); }}><span className="favorite-pin">⌖</span><span><strong>{name}</strong><small>点击查看实时天气</small></span><span>→</span></button>)}</div> : <div className="empty-favorites"><span>♡</span><p>把常看的城市放在这里，下一次打开会更快。</p><button onClick={toggleFavorite}>收藏 {location.name}</button></div>}</section>
+    <section className="section-block favorites-block" id="favorites"><div className="section-heading"><div><p className="section-label">你的城市</p><h2>收藏夹</h2></div><span>{favorites.length ? `${favorites.length} 个城市` : "还没有收藏"}</span></div>{favorites.length ? <div className="favorite-list">{favorites.map((favorite) => <button type="button" className="favorite-city" key={favorite.cityId} onClick={() => { setQuery(favorite.name); void (async () => { const next = canSyncFavorite(favorite) ? { ...favorite, id: favorite.cityId } : await searchLocation(favorite.name); await loadWeather(next); })(); }}><span className="favorite-pin" aria-hidden="true">⌖</span><span><strong>{favorite.name}</strong><small>{user ? "已同步到账号" : "保存在当前设备"}</small></span><span aria-hidden="true">→</span></button>)}</div> : <div className="empty-favorites"><span aria-hidden="true">♡</span><p>把常看的城市放在这里，下一次打开会更快。</p><button type="button" onClick={() => void toggleFavorite()}>收藏 {location.name}</button></div>}</section>
 
     <footer className="footer" id="about"><div><span className="footer-mark">isobar.</span><p>把天气变成更轻松的决定。</p></div><div className="source-note"><span>数据来源</span><a href="https://open-meteo.com/" target="_blank" rel="noreferrer">Open-Meteo</a><small>免费公开天气模型 · {isLoading ? "正在同步" : "刚刚更新"}</small></div></footer>
 
-    {(authOpen || profileOpen) && <div className="modal-backdrop" role="presentation"><section className="account-modal" role="dialog" aria-modal="true" aria-labelledby="account-title">{profileOpen && user ? <><button className="modal-close" onClick={() => setProfileOpen(false)} aria-label="关闭">×</button><p className="section-label">个人中心</p><h2 id="account-title">你好，{user.displayName}</h2><p className="modal-copy">你的天气偏好和收藏城市都在这里。我们会把常用位置记在当前设备上。</p><div className="profile-card"><span className="avatar large">{user.displayName.slice(0, 1).toUpperCase()}</span><div><strong>{user.displayName}</strong><small>{user.email}</small></div></div><div className="profile-stats"><span><strong>{favorites.length}</strong><small>收藏城市</small></span><span><strong>7</strong><small>天预报</small></span><span><strong>4</strong><small>数据维度</small></span></div><a className="modal-secondary" href={signOutHref} target="_top">退出登录</a></> : <><button className="modal-close" onClick={() => setAuthOpen(false)} aria-label="关闭">×</button><div className="auth-tabs"><button className={authMode === "login" ? "active" : ""} onClick={() => setAuthMode("login")}>登录</button><button className={authMode === "register" ? "active" : ""} onClick={() => setAuthMode("register")}>注册</button></div><p className="section-label">{authMode === "login" ? "欢迎回来" : "创建你的天气空间"}</p><h2 id="account-title">{authMode === "login" ? "登录后，收藏你的城市。" : "注册一个更懂你的天气账号。"}</h2><p className="modal-copy">登录和注册使用 ChatGPT 账号，安全、快速，不需要额外记住一组密码。</p><a className="modal-primary" href={signInHref} target="_top">使用 ChatGPT {authMode === "login" ? "登录" : "注册并登录"} <span>→</span></a><p className="modal-footnote">继续即表示你同意天气服务的使用条款。</p></>}</section></div>}
+    {(authOpen || profileOpen) && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) { setAuthOpen(false); setProfileOpen(false); } }}><section className="account-modal" role="dialog" aria-modal="true" aria-labelledby="account-title" aria-describedby="account-description">{profileOpen && user ? <><button type="button" className="modal-close" onClick={() => setProfileOpen(false)} aria-label="关闭个人中心">×</button><p className="section-label">个人中心</p><h2 id="account-title">你好，{user.displayName}</h2><p className="modal-copy" id="account-description">收藏城市已同步到你的账号，可以在其他设备继续查看。</p><div className="profile-card"><span className="avatar large">{user.displayName.slice(0, 1).toUpperCase()}</span><div><strong>{user.displayName}</strong><small>{user.email}</small></div></div><div className="profile-stats"><span><strong>{favorites.length}</strong><small>收藏城市</small></span><span><strong>7</strong><small>天预报</small></span><span><strong>4</strong><small>数据维度</small></span></div><p className="profile-sync" aria-live="polite">{favoriteSync === "synced" ? "收藏已同步" : favoriteSync === "saving" ? "收藏同步中" : favoriteSync === "error" ? favoriteMessage : "收藏保存在当前设备"}</p><a className="modal-secondary" href={signOutHref} target="_top">退出登录</a></> : <><button type="button" className="modal-close" onClick={() => setAuthOpen(false)} aria-label="关闭登录窗口">×</button><div className="auth-tabs" role="tablist" aria-label="账号操作"><button type="button" role="tab" aria-selected={authMode === "login"} className={authMode === "login" ? "active" : ""} onClick={() => setAuthMode("login")}>登录</button><button type="button" role="tab" aria-selected={authMode === "register"} className={authMode === "register" ? "active" : ""} onClick={() => setAuthMode("register")}>注册</button></div><p className="section-label">{authMode === "login" ? "欢迎回来" : "创建你的天气空间"}</p><h2 id="account-title">{authMode === "login" ? "登录后，收藏你的城市。" : "注册一个更懂你的天气账号。"}</h2><p className="modal-copy" id="account-description">登录和注册使用 ChatGPT 账号，安全、快速，不需要额外记住一组密码。</p><a className="modal-primary" href={signInHref} target="_top">使用 ChatGPT {authMode === "login" ? "登录" : "注册并登录"} <span aria-hidden="true">→</span></a><p className="modal-footnote">继续即表示你同意天气服务的使用条款。</p></>}</section></div>}
   </main>;
 }
