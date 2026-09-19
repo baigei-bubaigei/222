@@ -276,7 +276,6 @@ export default function WeatherDashboard({ user, signInHref, signOutHref }: { us
   useEffect(() => { void loadWeather(DEFAULT_LOCATION); }, []);
 
   // 登录后以 D1 为收藏夹来源，并将游客期间保存的完整城市快照合并进去。
-  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => {
     let active = true;
     const localFavorites = readLocalFavorites();
